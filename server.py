@@ -13,6 +13,8 @@ import time
 from collections import OrderedDict
 
 # --- Configuration ---
+HOST, PORT = "localhost", 9999
+
 DATA_FILE = "store.dat"
 COMPACTION_THRESHOLD = 0.5  # If half the file is old, overwritten data, I'll clean it up.
 
@@ -163,16 +165,28 @@ class KeyValueStore:
         I'll find all the keys and their latest values within a given alphabetical range.
         This isn't the most efficient thing because I have to sort all the keys first.
         """
+        result = []
         with self.lock:
-            result = []
+            # First, get a list of keys and their file positions while holding the lock
+            keys_to_read = []
             sorted_keys = sorted(self.keys.keys())
             
             for key in sorted_keys:
                 if start_key <= key <= end_key:
-                    value = self.read(key)
-                    if value is not None:
-                        result.append((key, value))
-            return result
+                    # Get the file position and size.
+                    keys_to_read.append((key, self.keys[key][0], self.keys[key][1]))
+
+        # Now, release the lock and read the values from the file
+        with open(self.data_file, 'rb') as f:
+            for key, pos, size in keys_to_read:
+                f.seek(pos)
+                header = f.read(16)
+                timestamp, key_size, value_size = struct.unpack("!QII", header)
+                f.seek(pos + 16 + key_size)
+                value = f.read(value_size).decode('utf-8')
+                if value != "DELETED":
+                    result.append((key, value))
+        return result
 
     def batch_put(self, items):
         """
@@ -214,21 +228,60 @@ class KeyValueStore:
         with a value of "DELETED". The old data will be cleaned up during the next compaction run.
         """
         with self.lock:
+            # Check if the key exists before trying to delete it
             if key not in self.keys:
                 return False
+
+            value_bytes = "DELETED".encode('utf-8')
+            key_bytes = key.encode('utf-8')
+
+            timestamp = int(time.time())
+            key_size = len(key_bytes)
+            value_size = len(value_bytes)
+
+            header = struct.pack("!QII", timestamp, key_size, value_size)
             
-            return self.put(key, "DELETED")
+            with open(self.data_file, 'ab') as f:
+                pos = f.tell()
+                f.write(header)
+                f.write(key_bytes)
+                f.write(value_bytes)
+
+            entry_size = 16 + key_size + value_size
+            
+            # Now, update my in-memory index.
+            if key in self.keys:
+                old_pos, old_size, _ = self.keys[key]
+                self.deleted_size += old_size
+            
+            self.keys[key] = (pos, entry_size, timestamp)
+            self.data_size += entry_size
+            
+            # Since we just added a tombstone, we may need to compact
+            if self.data_size > 0 and self.deleted_size / self.data_size > COMPACTION_THRESHOLD:
+                self._compact()
+            
+            return True
+
 
 class ThreadedTCPRequestHandler(socketserver.BaseRequestHandler):
     def handle(self):
         # A new thread is created for each client, so I can handle multiple clients at once.
         data = self.request.recv(1024).decode('utf-8').strip()
+        
+        # Cleanly stop the server for testing
+        if data == "SHUTDOWN":
+            self.server.shutdown()
+            self.request.sendall(b"OK\n")
+            return
+
         command, *args = data.split(' ', 1)
         
         store = self.server.store
         response = ""
 
         try:
+            print(f"Received command: {command} with args: {args}")
             if command == "PUT":
                 key, value = args[0].split(' ', 1)
                 store.put(key, value)
@@ -264,21 +317,15 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         self.store = store
         self.daemon_threads = True
 
-def run_server():
-    HOST, PORT = "localhost", 9999
-    
+if __name__ == '__main__':
+    # This block ensures that the server runs only when this script is executed directly.
+    # It will not run when the file is imported as a module in another script, like server_tests.py.
+    print("Starting the server...")
     kv_store = KeyValueStore()
-    
     server = ThreadedTCPServer((HOST, PORT), ThreadedTCPRequestHandler, kv_store)
-    
-    with server:
-        server_thread = threading.Thread(target=server.serve_forever)
-        server_thread.daemon = True
-        server_thread.start()
-        print(f"Server started on {HOST}:{PORT}")
-        
-        # This keeps the main program running so the server thread can do its thing.
-        server_thread.join()
-
-if __name__ == "__main__":
-    run_server()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("Server shut down.")
+    finally:
+        server.server_close()
