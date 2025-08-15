@@ -46,4 +46,10 @@ python server.py
 python client.py
 ```
 
-Enjoy!
+## Testing
+
+To run tests, I have included a test file: `server_tests.py`
+
+Simply run `puthon3 server_tests.py`
+
+This will verify that all methods in the server are working as expected.
